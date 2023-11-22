@@ -1,6 +1,7 @@
 from vton import VTONService
 from aiohttp import web
 import argparse
+from PIL import Image
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -11,14 +12,14 @@ def parse_args():
         help="Path to the output directory",
     )
 
-    parser.add_argument("--save_name", type=str, required=True, help="Name of the saving folder inside output_dir")
-    parser.add_argument("--test_order", type=str, required=True, choices=["unpaired", "paired"])
+    # parser.add_argument("--save_name", type=str, required=True, help="Name of the saving folder inside output_dir")
+    # parser.add_argument("--test_order", type=str, required=True, choices=["unpaired", "paired"])
 
 
-    parser.add_argument("--unet_dir", required=True, type=str, help="Directory where to load the trained unet from")
-    parser.add_argument("--unet_name", type=str, default="latest",
-                        help="Name of the unet to load from the directory specified by `--unet_dir`. "
-                             "To load the latest checkpoint, use `latest`.")
+    # parser.add_argument("--unet_dir", required=True, type=str, help="Directory where to load the trained unet from")
+    # parser.add_argument("--unet_name", type=str, default="latest",
+    #                     help="Name of the unet to load from the directory specified by `--unet_dir`. "
+    #                          "To load the latest checkpoint, use `latest`.")
 
     parser.add_argument(
         "--inversion_adapter_dir", type=str, default=None,
@@ -87,32 +88,50 @@ def parse_args():
     parser.add_argument("--guidance_scale", default=7.5, type=float, help="Guidance scale for the diffusion")
     parser.add_argument("--use_clip_cloth_features", action="store_true",
                         help="Whether to use precomputed clip cloth features")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default=None,
+        choices=["no", "fp16", "bf16"],
+        help=(
+            "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
+            " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
+            " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
+        ),
+    )
 
     args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
 
     return args
 
-async def status(request):
-    return web.Response(text="alive")
-
-async def handle_execute(request, vton):
-    # download img data from storage
-    img = vton.generate_image(None, None)
-    # upload img data to storage
-    # send reference
-    ref = "some ref"
-    return web.Response(text=ref)
 
 
-if __name__ == '__main__':
+def main():
     args = parse_args()
     vton = VTONService(args)
+
+    async def status(request):
+        return web.Response(text="alive")
+
+    async def handle_execute(request):
+        # download img data from storage
+        person_path = "./person.jpg"
+        cloth_path = "./cloth.jpg"
+        person = Image.open(person_path)
+        cloth = Image.open(cloth_path)
+        img = vton.generate_image(person, cloth)
+
+        # upload img data to storage
+        # send reference
+        ref = "some ref"
+        return web.Response(text=ref)
+
     app = web.Application()
     app.add_routes([
         web.get('/', status),
-        web.post('/execute', handle_execute, {"vton": vton})
+        web.post('/execute', handle_execute)
     ])
     web.run_app(app)
+
+if __name__ == '__main__':
+    main()

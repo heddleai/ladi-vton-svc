@@ -1,6 +1,3 @@
 [submodule "ladi_vton"]
 	path = ladi_vton
 	url = https://github.com/miccunifi/ladi-vton.git
-[submodule "cloth_segm"]
-	path = cloth_segm
-	url = https://github.com/wildoctopus/huggingface-cloth-segmentation.git

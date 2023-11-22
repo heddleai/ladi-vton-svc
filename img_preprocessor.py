@@ -6,10 +6,10 @@ import pickle
 import sys
 from pathlib import Path
 from typing import Tuple, Literal
+from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
 
 PROJECT_ROOT = Path(__file__).absolute().parents[2].absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, "./cloth_segm")
 
 import cv2
 import numpy as np
@@ -23,7 +23,9 @@ import torch.nn as nn
 
 from ladi_vton.src.utils.posemap import get_coco_body25_mapping
 from ladi_vton.src.utils.posemap import kpoint_to_heatmap
-from cloth_segm.process import load_seg_model, generate_mask, get_palette
+
+from openpose.body.estimator import BodyPoseEstimator
+from openpose.utils import draw_body_connections, draw_keypoints
 
 class ImgPreprocessor():
     def __init__(self,
@@ -61,6 +63,8 @@ class ImgPreprocessor():
 
         self.tps, self.refinement = torch.hub.load(repo_or_dir='miccunifi/ladi-vton', source='github', model='warping_module',
                                      dataset="vitonhd")
+        self.tps.eval()
+        self.refinement.eval()
 
         # if "clip_cloth_features" in self.outputlist:
         #     self.clip_cloth_features = torch.load(os.path.join(
@@ -81,14 +85,13 @@ class ImgPreprocessor():
         # self.up = nn.Upsample(size=(self.load_height, self.load_width), mode='bilinear')
         # self.gauss = T.GaussianBlur((15, 15), (3, 3))
         # self.gauss.cuda()
-        self.cloth_seg_model = load_seg_model("checkpoints/cloth_segm.pt", device="cuda")
 
 
     def preprocess(self, person_image, cloth_image):
         category = 'upper_body'
 
         if "clip_cloth_features" in self.outputlist:  # Precomputed CLIP in-shop embeddings
-            clip_cloth_features = self.clip_cloth_features[self.clip_cloth_features_names.index(c_name)].float()
+            clip_cloth_features = None
 
         if "cloth" in self.outputlist:  # In-shop clothing image
             # Clothing image
@@ -121,8 +124,7 @@ class ImgPreprocessor():
 
         if "im_pose" in self.outputlist or "parser_mask" in self.outputlist or "im_mask" in self.outputlist or "parse_mask_total" in self.outputlist or "parse_array" in self.outputlist or "pose_map" in self.outputlist or "parse_array" in self.outputlist or "shape" in self.outputlist or "im_head" in self.outputlist:
             # Label Map
-            parse_name = im_name.replace('.jpg', '.png')
-            im_parse = Image.open(os.path.join(dataroot, self.phase, 'image-parse-v3', parse_name))
+            im_parse = self.get_image_parse(image)
             im_parse = im_parse.resize((self.width, self.height), Image.NEAREST)
             parse_array = np.array(im_parse)
 
@@ -130,26 +132,27 @@ class ImgPreprocessor():
 
             parse_head = (parse_array == 1).astype(np.float32) + \
                          (parse_array == 2).astype(np.float32) + \
-                         (parse_array == 4).astype(np.float32) + \
-                         (parse_array == 13).astype(np.float32)
+                         (parse_array == 3).astype(np.float32) + \
+                         (parse_array == 11).astype(np.float32)
 
             parser_mask_fixed = (parse_array == 1).astype(np.float32) + \
                                 (parse_array == 2).astype(np.float32) + \
-                                (parse_array == 18).astype(np.float32) + \
-                                (parse_array == 19).astype(np.float32)
+                                (parse_array == 9).astype(np.float32) + \
+                                (parse_array == 10).astype(np.float32) + \
+                                (parse_array == 8).astype(np.float32)
 
             parser_mask_changeable = (parse_array == 0).astype(np.float32)
 
             arms = (parse_array == 14).astype(np.float32) + (parse_array == 15).astype(np.float32)
 
-            parse_cloth = (parse_array == 5).astype(np.float32) + \
-                          (parse_array == 6).astype(np.float32) + \
-                          (parse_array == 7).astype(np.float32)
-            parse_mask = (parse_array == 5).astype(np.float32) + \
-                         (parse_array == 6).astype(np.float32) + \
-                         (parse_array == 7).astype(np.float32)
+            parse_cloth = (parse_array == 4).astype(np.float32) + \
+                          (parse_array == 7).astype(np.float32) + \
+                          (parse_array == 17).astype(np.float32)
+            parse_mask = (parse_array == 4).astype(np.float32) + \
+                         (parse_array == 7).astype(np.float32) + \
+                         (parse_array == 17).astype(np.float32)
 
-            parser_mask_fixed = parser_mask_fixed + (parse_array == 9).astype(np.float32) + \
+            parser_mask_fixed = parser_mask_fixed + (parse_array == 6).astype(np.float32) + \
                                 (parse_array == 12).astype(np.float32)  # the lower body is fixed
 
             parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
@@ -169,16 +172,13 @@ class ImgPreprocessor():
             parse_shape = parse_shape.resize((self.width, self.height), Image.BILINEAR)
 
             # Load pose points
-            pose_name = im_name.replace('.jpg', '_keypoints.json')
-            with open(os.path.join(dataroot, self.phase, 'openpose_json', pose_name), 'r') as f:
-                pose_label = json.load(f)
-                pose_data = pose_label['people'][0]['pose_keypoints_2d']
-                pose_data = np.array(pose_data)
-                pose_data = pose_data.reshape((-1, 3))[:, :2]
+            pose_data = self.get_image_keypoints(image)
+            pose_data = np.array(pose_data)
+            pose_data = pose_data.reshape((-1, 3))[:, :2]
 
-                # rescale keypoints on the base of height and width
-                pose_data[:, 0] = pose_data[:, 0] * (self.width / 768)
-                pose_data[:, 1] = pose_data[:, 1] * (self.height / 1024)
+            # rescale keypoints on the base of height and width
+            pose_data[:, 0] = pose_data[:, 0] * (self.width / 768)
+            pose_data[:, 1] = pose_data[:, 1] * (self.height / 1024)
 
             pose_mapping = get_coco_body25_mapping()
 
@@ -228,50 +228,48 @@ class ImgPreprocessor():
             arms_draw = ImageDraw.Draw(im_arms)
 
             # do in any case because i have only upperbody
-            with open(os.path.join(dataroot, self.phase, 'openpose_json', pose_name), 'r') as f:
-                data = json.load(f)
-                data = data['people'][0]['pose_keypoints_2d']
-                data = np.array(data)
-                data = data.reshape((-1, 3))[:, :2]
+            data = self.get_image_keypoints(image)
+            data = np.array(data)
+            data = data.reshape((-1, 3))[:, :2]
 
-                # rescale keypoints on the base of height and width
-                data[:, 0] = data[:, 0] * (self.width / 768)
-                data[:, 1] = data[:, 1] * (self.height / 1024)
+            # rescale keypoints on the base of height and width
+            data[:, 0] = data[:, 0] * (self.width / 768)
+            data[:, 1] = data[:, 1] * (self.height / 1024)
 
-                shoulder_right = tuple(data[pose_mapping[2]])
-                shoulder_left = tuple(data[pose_mapping[5]])
-                elbow_right = tuple(data[pose_mapping[3]])
-                elbow_left = tuple(data[pose_mapping[6]])
-                wrist_right = tuple(data[pose_mapping[4]])
-                wrist_left = tuple(data[pose_mapping[7]])
+            shoulder_right = tuple(data[pose_mapping[2]])
+            shoulder_left = tuple(data[pose_mapping[5]])
+            elbow_right = tuple(data[pose_mapping[3]])
+            elbow_left = tuple(data[pose_mapping[6]])
+            wrist_right = tuple(data[pose_mapping[4]])
+            wrist_left = tuple(data[pose_mapping[7]])
 
-                ARM_LINE_WIDTH = int(90 / 512 * self.height)
-                if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
-                    if elbow_right[0] <= 1. and elbow_right[1] <= 1.:
-                        arms_draw.line(
-                            np.concatenate((wrist_left, elbow_left, shoulder_left, shoulder_right)).astype(
-                                np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-                    else:
-                        arms_draw.line(np.concatenate(
-                            (wrist_left, elbow_left, shoulder_left, shoulder_right, elbow_right)).astype(
-                            np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-                elif wrist_left[0] <= 1. and wrist_left[1] <= 1.:
-                    if elbow_left[0] <= 1. and elbow_left[1] <= 1.:
-                        arms_draw.line(
-                            np.concatenate((shoulder_left, shoulder_right, elbow_right, wrist_right)).astype(
-                                np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-                    else:
-                        arms_draw.line(np.concatenate(
-                            (elbow_left, shoulder_left, shoulder_right, elbow_right, wrist_right)).astype(
+            ARM_LINE_WIDTH = int(90 / 512 * self.height)
+            if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
+                if elbow_right[0] <= 1. and elbow_right[1] <= 1.:
+                    arms_draw.line(
+                        np.concatenate((wrist_left, elbow_left, shoulder_left, shoulder_right)).astype(
                             np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
                 else:
                     arms_draw.line(np.concatenate(
-                        (wrist_left, elbow_left, shoulder_left, shoulder_right, elbow_right, wrist_right)).astype(
+                        (wrist_left, elbow_left, shoulder_left, shoulder_right, elbow_right)).astype(
                         np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
+            elif wrist_left[0] <= 1. and wrist_left[1] <= 1.:
+                if elbow_left[0] <= 1. and elbow_left[1] <= 1.:
+                    arms_draw.line(
+                        np.concatenate((shoulder_left, shoulder_right, elbow_right, wrist_right)).astype(
+                            np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
+                else:
+                    arms_draw.line(np.concatenate(
+                        (elbow_left, shoulder_left, shoulder_right, elbow_right, wrist_right)).astype(
+                        np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
+            else:
+                arms_draw.line(np.concatenate(
+                    (wrist_left, elbow_left, shoulder_left, shoulder_right, elbow_right, wrist_right)).astype(
+                    np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
 
-                hands = np.logical_and(np.logical_not(im_arms), arms)
-                parse_mask += im_arms
-                parser_mask_fixed += hands
+            hands = np.logical_and(np.logical_not(im_arms), arms)
+            parse_mask += im_arms
+            parser_mask_fixed += hands
 
             # delete neck
             parse_head_2 = torch.clone(parse_head)
@@ -339,9 +337,28 @@ class ImgPreprocessor():
             result[k] = vars()[k]
 
         return result
+    
+    def get_image_keypoints(self, img):
+        estimator = BodyPoseEstimator(pretrained=True)
+        keypoints = estimator(img)
+        return keypoints
 
     def get_image_parse(self, img):
-        # img = TF.to_tensor(img).cuda()
-        # img = TF.center_crop(img, (768, 768))
-        mask = generate_mask(img, self.cloth_seg_model, get_palette(4), "cuda")
-        return mask
+        processor = SegformerImageProcessor.from_pretrained("mattmdjaga/segformer_b2_clothes")
+        model = AutoModelForSemanticSegmentation.from_pretrained("mattmdjaga/segformer_b2_clothes")
+
+        inputs = processor(images=img, return_tensors="pt")
+
+        outputs = model(**inputs)
+        logits = outputs.logits.cpu()
+
+        upsampled_logits = nn.functional.interpolate(
+            logits,
+            size=img.size[::-1],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        pred_seg = upsampled_logits.argmax(dim=1)[0]
+        print(pred_seg.shape)
+        return pred_seg

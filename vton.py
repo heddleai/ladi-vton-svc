@@ -9,6 +9,9 @@ from diffusers.utils.import_utils import is_xformers_available
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, AutoProcessor
 from img_preprocessor import ImgPreprocessor
 
+import sys
+sys.path.insert(0, "./ladi_vton")
+
 from ladi_vton.src.models.AutoencoderKL import AutoencoderKL
 from ladi_vton.src.models.emasc import EMASC
 from ladi_vton.src.models.inversion_adapter import InversionAdapter
@@ -31,13 +34,12 @@ os.environ["WANDB_START_METHOD"] = "thread"
 
 @torch.no_grad()
 def generate_images_from_tryon_pipe(pipe: StableDiffusionTryOnePipeline, inversion_adapter: InversionAdapter,
-                                    batch: dict, output_dir: str, order: str,
-                                    save_name: str, text_usage: str, vision_encoder: CLIPVisionModelWithProjection,
+                                    batch: dict, output_dir: str, text_usage: str, vision_encoder: CLIPVisionModelWithProjection,
                                     processor: CLIPProcessor, cloth_input_type: str, cloth_cond_rate: int = 1,
                                     num_vstar: int = 1, seed: int = 1234, num_inference_steps: int = 50,
                                     guidance_scale: int = 7.5, use_png: bool = False):
     # Create output directory
-    save_path = os.path.join(output_dir, f"{save_name}_{order}")
+    save_path = os.path.join(output_dir)
     os.makedirs(save_path, exist_ok=True)
 
     # Set seed
@@ -153,6 +155,7 @@ class VTONService():
         # Setup accelerator and device.
         accelerator = Accelerator()
         device = accelerator.device
+        dataset = "vitonhd"
 
         # If passed along, set the training seed now.
         if args.seed is not None:
@@ -160,74 +163,59 @@ class VTONService():
 
         # Load scheduler, tokenizer and models.
         val_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-        val_scheduler.set_timesteps(args.num_inference_steps, device=device)
+        val_scheduler.set_timesteps(50, device=device)
         text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
         vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
-        unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+        vision_encoder = CLIPVisionModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        processor = AutoProcessor.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
         tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
 
-        # Define the extended unet
-        new_in_channels = 27 if args.cloth_input_type == "none" else 31
-        # the posemap has 18 channels, the (encoded) cloth has 4 channels, the standard SD inpaining has 9 channels
-        with torch.no_grad():
-            # Replace the first conv layer of the unet with a new one with the correct number of input channels
-            conv_new = torch.nn.Conv2d(
-                in_channels=new_in_channels,
-                out_channels=unet.conv_in.out_channels,
-                kernel_size=3,
-                padding=1,
-            )
+        # Load the trained models from the hub
+        unet = torch.hub.load(repo_or_dir='miccunifi/ladi-vton', source='github', model='extended_unet',
+                            dataset=dataset)
+        emasc = torch.hub.load(repo_or_dir='miccunifi/ladi-vton', source='github', model='emasc', dataset=dataset)
+        inversion_adapter = torch.hub.load(repo_or_dir='miccunifi/ladi-vton', source='github', model='inversion_adapter',
+                                        dataset=dataset)
+        
+        weight_dtype = torch.float16
 
-            torch.nn.init.kaiming_normal_(conv_new.weight)  # Initialize new conv layer
-            conv_new.weight.data = conv_new.weight.data * 0.  # Zero-initialize new conv layer
+        text_encoder.to(device, dtype=weight_dtype)
+        vae.to(device, dtype=weight_dtype)
+        emasc.to(device, dtype=weight_dtype)
+        inversion_adapter.to(device, dtype=weight_dtype)
+        unet.to(device, dtype=weight_dtype)
+        vision_encoder.to(device, dtype=weight_dtype)
 
-            conv_new.weight.data[:, :9] = unet.conv_in.weight.data  # Copy weights from old conv layer
-            conv_new.bias.data = unet.conv_in.bias.data  # Copy bias from old conv layer
+        # Set to eval mode
+        text_encoder.eval()
+        vae.eval()
+        emasc.eval()
+        inversion_adapter.eval()
+        unet.eval()
+        vision_encoder.eval()
+        int_layers = [1, 2, 3, 4, 5]
 
-            unet.conv_in = conv_new  # replace conv layer in unet
-            unet.config['in_channels'] = new_in_channels  # update config
+        # # Define the extended unet
+        # new_in_channels = 27 if args.cloth_input_type == "none" else 31
+        # # the posemap has 18 channels, the (encoded) cloth has 4 channels, the standard SD inpaining has 9 channels
+        # with torch.no_grad():
+        #     # Replace the first conv layer of the unet with a new one with the correct number of input channels
+        #     conv_new = torch.nn.Conv2d(
+        #         in_channels=new_in_channels,
+        #         out_channels=unet.conv_in.out_channels,
+        #         kernel_size=3,
+        #         padding=1,
+        #     )
 
-        # Load the trained unet
-        if args.unet_name != "latest":
-            path = args.unet_name
-        else:
-            # Get the most recent checkpoint
-            dirs = os.listdir(args.unet_dir)
-            dirs = [d for d in dirs if d.startswith("unet")]
-            dirs = sorted(dirs, key=lambda x: int(os.path.splitext(x.split("_")[-1])[0]))
-            path = dirs[-1]
-        accelerator.print(f"Loading Unet checkpoint {path}")
-        unet.load_state_dict(torch.load(os.path.join(args.unet_dir, path)))
+        #     torch.nn.init.kaiming_normal_(conv_new.weight)  # Initialize new conv layer
+        #     conv_new.weight.data = conv_new.weight.data * 0.  # Zero-initialize new conv layer
 
-        if args.emasc_type != 'none':
-            # Define EMASC model.
-            in_feature_channels = [128, 128, 128, 256, 512]
-            out_feature_channels = [128, 256, 512, 512, 512]
-            int_layers = [1, 2, 3, 4, 5]
+        #     conv_new.weight.data[:, :9] = unet.conv_in.weight.data  # Copy weights from old conv layer
+        #     conv_new.bias.data = unet.conv_in.bias.data  # Copy bias from old conv layer
 
-            emasc = EMASC(in_feature_channels,
-                          out_feature_channels,
-                          kernel_size=args.emasc_kernel,
-                          padding=args.emasc_padding,
-                          stride=1,
-                          type=args.emasc_type)
+        #     unet.conv_in = conv_new  # replace conv layer in unet
+        #     unet.config['in_channels'] = new_in_channels  # update config
 
-            if args.emasc_dir is not None:
-                if args.emasc_name != "latest":
-                    path = args.emasc_name
-                else:
-                    # Get the most recent checkpoint
-                    dirs = os.listdir(args.emasc_dir)
-                    dirs = [d for d in dirs if d.startswith("emasc")]
-                    dirs = sorted(dirs, key=lambda x: int(os.path.splitext(x.split("_")[-1])[0]))
-                    path = dirs[-1]
-                accelerator.print(f"Loading EMASC checkpoint {path}")
-                emasc.load_state_dict(torch.load(os.path.join(args.emasc_dir, path)))
-            else:
-                raise ValueError("No EMASC checkpoint found. Make sure to specify --emasc_dir")
-        else:
-            emasc = None
-            int_layers = None
 
         if args.enable_xformers_memory_efficient_attention:
             if is_xformers_available():
@@ -241,73 +229,52 @@ class VTONService():
         if args.cloth_input_type == 'warped':
             outputlist.append('warped_cloth')
 
-        if args.text_usage == 'inversion_adapter':
-            if args.pretrained_model_name_or_path == "runwayml/stable-diffusion-inpainting":
-                vision_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
-                processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
-            elif args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-2-inpainting":
-                vision_encoder = CLIPVisionModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
-                processor = AutoProcessor.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
-            else:
-                raise ValueError(f"Unknown pretrained model name or path: {args.pretrained_model_name_or_path}")
-            vision_encoder.requires_grad_(False)
+        # if args.text_usage == 'inversion_adapter':
+        #     if args.pretrained_model_name_or_path == "runwayml/stable-diffusion-inpainting":
+        #         vision_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
+        #         processor = AutoProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        #     elif args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-2-inpainting":
+        #         vision_encoder = CLIPVisionModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        #         processor = AutoProcessor.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        #     else:
+        #         raise ValueError(f"Unknown pretrained model name or path: {args.pretrained_model_name_or_path}")
+        #     vision_encoder.requires_grad_(False)
 
-            inversion_adapter = InversionAdapter(input_dim=vision_encoder.config.hidden_size,
-                                                hidden_dim=vision_encoder.config.hidden_size * 4,
-                                                output_dim=text_encoder.config.hidden_size * args.num_vstar,
-                                                num_encoder_layers=args.num_encoder_layers,
-                                                config=vision_encoder.config)
+        #     inversion_adapter = InversionAdapter(input_dim=vision_encoder.config.hidden_size,
+        #                                         hidden_dim=vision_encoder.config.hidden_size * 4,
+        #                                         output_dim=text_encoder.config.hidden_size * args.num_vstar,
+        #                                         num_encoder_layers=args.num_encoder_layers,
+        #                                         config=vision_encoder.config)
 
-            if args.inversion_adapter_dir is not None:
-                if args.inversion_adapter_name != "latest":
-                    path = args.inversion_adapter_name
-                else:
-                    # Get the most recent checkpoint
-                    dirs = os.listdir(args.inversion_adapter_dir)
-                    dirs = [d for d in dirs if d.startswith("inversion_adapter")]
-                    dirs = sorted(dirs, key=lambda x: int(os.path.splitext(x.split("_")[-1])[0]))
-                    path = dirs[-1]
-                accelerator.print(f"Loading inversion adapter checkpoint {path}")
-                inversion_adapter.load_state_dict(torch.load(os.path.join(args.inversion_adapter_dir, path)))
-            else:
-                raise ValueError("No inversion adapter checkpoint found. Make sure to specify --inversion_adapter_dir")
+        #     if args.inversion_adapter_dir is not None:
+        #         if args.inversion_adapter_name != "latest":
+        #             path = args.inversion_adapter_name
+        #         else:
+        #             # Get the most recent checkpoint
+        #             dirs = os.listdir(args.inversion_adapter_dir)
+        #             dirs = [d for d in dirs if d.startswith("inversion_adapter")]
+        #             dirs = sorted(dirs, key=lambda x: int(os.path.splitext(x.split("_")[-1])[0]))
+        #             path = dirs[-1]
+        #         accelerator.print(f"Loading inversion adapter checkpoint {path}")
+        #         inversion_adapter.load_state_dict(torch.load(os.path.join(args.inversion_adapter_dir, path)))
+        #     else:
+        #         raise ValueError("No inversion adapter checkpoint found. Make sure to specify --inversion_adapter_dir")
 
-            inversion_adapter.requires_grad_(False)
+        #     inversion_adapter.requires_grad_(False)
 
-            if args.use_clip_cloth_features:
-                outputlist.append('clip_cloth_features')
-                vision_encoder = None
-            else:
-                outputlist.append('cloth')
-        else:
-            inversion_adapter = None
-            vision_encoder = None
-            processor = None
+        #     if args.use_clip_cloth_features:
+        #         outputlist.append('clip_cloth_features')
+        #         vision_encoder = None
+        #     else:
+        #         outputlist.append('cloth')
+        # else:
+        #     inversion_adapter = None
+        #     vision_encoder = None
+        #     processor = None
 
 
-        weight_dtype = torch.float16
 
-        # Move models to device and eval mode
-        text_encoder.to(device, dtype=weight_dtype)
-        text_encoder.eval()
-        vae.to(device, dtype=weight_dtype)
-        vae.eval()
-        unet.to(device, dtype=weight_dtype)
-        unet.eval()
-        if emasc is not None:
-            emasc.to(device, dtype=weight_dtype)
-            emasc.eval()
-        if inversion_adapter is not None:
-            inversion_adapter.to(device, dtype=weight_dtype)
-            inversion_adapter.eval()
-        if vision_encoder is not None:
-            vision_encoder.to(device, dtype=weight_dtype)
-            vision_encoder.eval()
-
-        self.inversion_adapter = inversion_adapter
-        self.vision_encoder = vision_encoder
-        self.processor = processor
-        # Define the pipeline
+        # Create the pipeline
         self.val_pipe = StableDiffusionTryOnePipeline(
             text_encoder=text_encoder,
             vae=vae,
@@ -317,14 +284,17 @@ class VTONService():
             emasc=emasc,
             emasc_int_layers=int_layers,
         ).to(device)
-        self.img_preprocessor = ImgPreprocessor()
+
+        self.inversion_adapter = inversion_adapter
+        self.vision_encoder = vision_encoder
+        self.processor = processor
 
     def generate_image(self, person_image, cloth_image):
         batch = self.img_preprocessor.preprocess(person_image, cloth_image)
         # Generate images
         with torch.cuda.amp.autocast():
             generate_images_from_tryon_pipe(self.val_pipe, self.inversion_adapter, batch, self.args.output_dir,
-                                            self.args.test_order, self.args.save_name, self.args.text_usage, self.vision_encoder, self.processor,
+                                            self.args.text_usage, self.vision_encoder, self.processor,
                                             self.args.cloth_input_type, 1, self.args.num_vstar, self.args.seed,
                                             self.args.num_inference_steps, self.args.guidance_scale, self.args.use_png)
 
