@@ -2,6 +2,8 @@ from vton import VTONService
 from aiohttp import web
 import argparse
 from PIL import Image
+import os
+import os.path as osp
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -105,7 +107,6 @@ def parse_args():
     return args
 
 
-
 def main():
     args = parse_args()
     vton = VTONService(args)
@@ -114,17 +115,45 @@ def main():
         return web.Response(text="alive")
 
     async def handle_execute(request):
+        async def download_to(field, pathname):
+            with open(osp.join(pathname, 'wb')) as f:
+                while True:
+                    chunk = await field.read_chunk()  # 8192 bytes by default.
+                    if not chunk:
+                        break
+                    f.write(chunk)
         # download img data from storage
-        person_path = "./person.jpg"
-        cloth_path = "./cloth.jpg"
+        reader = await request.multipart()
+
+        field = await reader.next()
+        assert field.name == 'request_id'
+        request_id = await field.read(decode=True) # will be used later on for progress
+        input_path = osp.join('inputs', request_id)
+        output_path = osp.join('outputs', request_id)
+        os.makedirs(input_path, exist_ok=True)
+        os.makedirs(output_path, exist_ok=True)
+        person_path = osp.join(input_path, 'person.jpg')
+        cloth_path = osp.join(input_path, 'cloth.jpg')
+        gen_path = osp.join(output_path, 'sample.jpg')
+
+        field = await reader.next()
+        assert field.name == 'person'
+        await download_to(field, person_path)
+
+        field = await reader.next()
+        assert field.name == 'cloth'
+        await download_to(field, cloth_path)
+
         person = Image.open(person_path)
         cloth = Image.open(cloth_path)
-        img = vton.generate_image(person, cloth)
+        vton.generate_image(person, cloth, gen_path)
+        gen_img = Image.open(gen_path)
+        img_bytes = gen_img.tobytes()
 
-        # upload img data to storage
-        # send reference
-        ref = "some ref"
-        return web.Response(text=ref)
+        # os.rmdir(input_path)
+        # os.rmdir(output_path)
+
+        return web.Response(body=img_bytes, status=200)
 
     app = web.Application()
     app.add_routes([

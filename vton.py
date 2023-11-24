@@ -34,14 +34,10 @@ os.environ["WANDB_START_METHOD"] = "thread"
 
 @torch.no_grad()
 def generate_images_from_tryon_pipe(pipe: StableDiffusionTryOnePipeline, inversion_adapter: InversionAdapter,
-                                    batch: dict, output_dir: str, text_usage: str, vision_encoder: CLIPVisionModelWithProjection,
+                                    batch: dict, output_path: str, text_usage: str, vision_encoder: CLIPVisionModelWithProjection,
                                     processor: CLIPProcessor, cloth_input_type: str, cloth_cond_rate: int = 1,
                                     num_vstar: int = 1, seed: int = 1234, num_inference_steps: int = 50,
-                                    guidance_scale: int = 7.5, use_png: bool = False):
-    # Create output directory
-    save_path = os.path.join(output_dir)
-    os.makedirs(save_path, exist_ok=True)
-
+                                    guidance_scale: int = 7.5, use_png: bool = False, device: str = "cuda"):
     # Set seed
     generator = torch.Generator("cuda").manual_seed(seed)
     num_samples = 1
@@ -55,26 +51,33 @@ def generate_images_from_tryon_pipe(pipe: StableDiffusionTryOnePipeline, inversi
     warped_cloth = batch.get('warped_cloth')
     category = batch.get("category")
 
+    model_img = model_img.to(device)
+    mask_img = mask_img.to(device)
+    pose_map = pose_map.to(device)
+    warped_cloth = warped_cloth.to(device)
+
     # Generate text prompts
     if text_usage == "noun_chunks":
         prompts = batch["captions"]
     elif text_usage == "none":
         prompts = [""] * len(batch["captions"])
     elif text_usage == 'inversion_adapter':
-        category_text = {
-            'dresses': 'a dress',
-            'upper_body': 'an upper body garment',
-            'lower_body': 'a lower body garment',
+        category_text = 'an upper body garment'
+        # category_text = {
+        #     'dresses': 'a dress',
+        #     'upper_body': 'an upper body garment',
+        #     'lower_body': 'a lower body garment',
 
-        }
-        text = [f'a photo of a model wearing {category_text[category]} {" $ " * num_vstar}' for
-                category in batch['category']]
+        # }
+        text = [f'a photo of a model wearing {category_text} {" $ " * num_vstar}']
 
         clip_cloth_features = batch.get('clip_cloth_features')
         if clip_cloth_features is None:
             with torch.no_grad():
                 # Get the visual features of the in-shop cloths
-                input_image = torchvision.transforms.functional.resize((batch["cloth"] + 1) / 2, (224, 224),
+                cloth = batch.get("cloth")
+                cloth = cloth.to(device)
+                input_image = torchvision.transforms.functional.resize((cloth + 1) / 2, (224, 224),
                                                                         antialias=True).clamp(0, 1)
                 processed_images = processor(images=input_image, return_tensors="pt")
                 clip_cloth_features = vision_encoder(
@@ -130,17 +133,12 @@ def generate_images_from_tryon_pipe(pipe: StableDiffusionTryOnePipeline, inversi
         ).images
 
     # Save images
-    for gen_image, cat, name in zip(generated_images, category, batch["im_name"]):
-        if not os.path.exists(os.path.join(save_path, cat)):
-            os.makedirs(os.path.join(save_path, cat))
-
-        if use_png:
-            name = name.replace(".jpg", ".png")
-            gen_image.save(
-                os.path.join(save_path, cat, name))
-        else:
-            gen_image.save(
-                os.path.join(save_path, cat, name), quality=95)
+    gen_image = generated_images[0]
+    if use_png:
+        output_path = output_path.replace(".jpg", ".png")
+        gen_image.save(output_path)
+    else:
+        gen_image.save(output_path, quality=95)
 
 
 @torch.inference_mode()
@@ -224,10 +222,10 @@ class VTONService():
                 raise ValueError("xformers is not available. Make sure it is installed correctly")
 
         # add posemap input to unet
-        outputlist = ['image', 'pose_map', 'captions', 'inpaint_mask', 'im_mask', 'category', 'im_name']
+        # outputlist = ['image', 'pose_map', 'captions', 'inpaint_mask', 'im_mask', 'category']
 
-        if args.cloth_input_type == 'warped':
-            outputlist.append('warped_cloth')
+        # if args.cloth_input_type == 'warped':
+        #     outputlist.append('warped_cloth')
 
         # if args.text_usage == 'inversion_adapter':
         #     if args.pretrained_model_name_or_path == "runwayml/stable-diffusion-inpainting":
@@ -288,13 +286,16 @@ class VTONService():
         self.inversion_adapter = inversion_adapter
         self.vision_encoder = vision_encoder
         self.processor = processor
+        self.img_preprocessor = ImgPreprocessor(outputlist=['image', 'pose_map', 'inpaint_mask', 'im_mask', 'category', 'cloth', 'warped_cloth'])
+        self.device = device
 
-    def generate_image(self, person_image, cloth_image):
-        batch = self.img_preprocessor.preprocess(person_image, cloth_image)
-        # Generate images
-        with torch.cuda.amp.autocast():
-            generate_images_from_tryon_pipe(self.val_pipe, self.inversion_adapter, batch, self.args.output_dir,
-                                            self.args.text_usage, self.vision_encoder, self.processor,
-                                            self.args.cloth_input_type, 1, self.args.num_vstar, self.args.seed,
-                                            self.args.num_inference_steps, self.args.guidance_scale, self.args.use_png)
+    def generate_image(self, person_image, cloth_image, output_path):
+        with torch.no_grad():
+            batch = self.img_preprocessor.preprocess(person_image, cloth_image)
+            # Generate images
+            with torch.cuda.amp.autocast():
+                generate_images_from_tryon_pipe(self.val_pipe, self.inversion_adapter, batch, self.args.output_path,
+                                                self.args.text_usage, self.vision_encoder, self.processor,
+                                                self.args.cloth_input_type, 1, self.args.num_vstar, self.args.seed,
+                                                self.args.num_inference_steps, self.args.guidance_scale, self.args.use_png, self.device)
 

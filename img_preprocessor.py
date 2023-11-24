@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import torchvision.transforms as T
+from torchvision.transforms import InterpolationMode
 import torch.nn as nn
 
 from ladi_vton.src.utils.posemap import get_coco_body25_mapping
@@ -89,6 +90,7 @@ class ImgPreprocessor():
 
     def preprocess(self, person_image, cloth_image):
         category = 'upper_body'
+        c_name = category
 
         if "clip_cloth_features" in self.outputlist:  # Precomputed CLIP in-shop embeddings
             clip_cloth_features = None
@@ -124,9 +126,10 @@ class ImgPreprocessor():
 
         if "im_pose" in self.outputlist or "parser_mask" in self.outputlist or "im_mask" in self.outputlist or "parse_mask_total" in self.outputlist or "parse_array" in self.outputlist or "pose_map" in self.outputlist or "parse_array" in self.outputlist or "shape" in self.outputlist or "im_head" in self.outputlist:
             # Label Map
-            im_parse = self.get_image_parse(image)
-            im_parse = im_parse.resize((self.width, self.height), Image.NEAREST)
-            parse_array = np.array(im_parse)
+            im_parse = self.get_image_parse(person_image)
+            im_parse = TF.resize(im_parse.unsqueeze(0), (self.height, self.width), InterpolationMode.NEAREST)
+            # im_parse = im_parse.resize((self.width, self.height), Image.NEAREST)
+            parse_array = np.array(im_parse.squeeze())
 
             parse_shape = (parse_array > 0).astype(np.float32)
 
@@ -172,18 +175,17 @@ class ImgPreprocessor():
             parse_shape = parse_shape.resize((self.width, self.height), Image.BILINEAR)
 
             # Load pose points
-            pose_data = self.get_image_keypoints(image)
-            pose_data = np.array(pose_data)
+            pose_data = self.get_image_keypoints(person_image)
             pose_data = pose_data.reshape((-1, 3))[:, :2]
+
 
             # rescale keypoints on the base of height and width
             pose_data[:, 0] = pose_data[:, 0] * (self.width / 768)
             pose_data[:, 1] = pose_data[:, 1] * (self.height / 1024)
 
-            pose_mapping = get_coco_body25_mapping()
+            # pose_mapping = get_coco_body25_mapping()
 
-            # point_num = pose_data.shape[0]
-            point_num = len(pose_mapping)
+            point_num = pose_data.shape[0]
 
             pose_map = torch.zeros(point_num, self.height, self.width)
             r = self.radius * (self.height / 512.0)
@@ -195,8 +197,8 @@ class ImgPreprocessor():
                 one_map = Image.new('L', (self.width, self.height))
                 draw = ImageDraw.Draw(one_map)
 
-                point_x = np.multiply(pose_data[pose_mapping[i], 0], 1)
-                point_y = np.multiply(pose_data[pose_mapping[i], 1], 1)
+                point_x = np.multiply(pose_data[i, 0], 1)
+                point_y = np.multiply(pose_data[i, 1], 1)
 
                 if point_x > 1 and point_y > 1:
                     draw.rectangle((point_x - r, point_y - r, point_x + r, point_y + r), 'white', 'white')
@@ -210,8 +212,8 @@ class ImgPreprocessor():
             d = []
 
             for idx in range(point_num):
-                ux = pose_data[pose_mapping[idx], 0]  # / (192)
-                uy = (pose_data[pose_mapping[idx], 1])  # / (256)
+                ux = pose_data[idx, 0]  # / (192)
+                uy = (pose_data[idx, 1])  # / (256)
 
                 # scale posemap points
                 px = ux  # * self.width
@@ -228,7 +230,7 @@ class ImgPreprocessor():
             arms_draw = ImageDraw.Draw(im_arms)
 
             # do in any case because i have only upperbody
-            data = self.get_image_keypoints(image)
+            data = self.get_image_keypoints(person_image)
             data = np.array(data)
             data = data.reshape((-1, 3))[:, :2]
 
@@ -236,12 +238,12 @@ class ImgPreprocessor():
             data[:, 0] = data[:, 0] * (self.width / 768)
             data[:, 1] = data[:, 1] * (self.height / 1024)
 
-            shoulder_right = tuple(data[pose_mapping[2]])
-            shoulder_left = tuple(data[pose_mapping[5]])
-            elbow_right = tuple(data[pose_mapping[3]])
-            elbow_left = tuple(data[pose_mapping[6]])
-            wrist_right = tuple(data[pose_mapping[4]])
-            wrist_left = tuple(data[pose_mapping[7]])
+            shoulder_right = tuple(data[2])
+            shoulder_left = tuple(data[5])
+            elbow_right = tuple(data[3])
+            elbow_left = tuple(data[6])
+            wrist_right = tuple(data[4])
+            wrist_left = tuple(data[7])
 
             ARM_LINE_WIDTH = int(90 / 512 * self.height)
             if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
@@ -302,7 +304,8 @@ class ImgPreprocessor():
             low_pose_map = TF.resize(pose_map, (256, 192),
                                     T.InterpolationMode.BILINEAR,
                                     antialias=True)
-            agnostic = torch.cat([low_im_mask, low_pose_map], 1)
+            agnostic = torch.cat([low_im_mask, low_pose_map], 0).unsqueeze(0)
+            low_cloth = low_cloth.unsqueeze(0)
             agnostic = agnostic.to(device="cpu")
             low_cloth = low_cloth.to(device="cpu")
             low_grid, theta, rx, ry, cx, cy, rg, cg = self.tps(low_cloth.to(torch.float32), agnostic.to(torch.float32))
@@ -313,10 +316,10 @@ class ImgPreprocessor():
                                                                     interpolation=T.InterpolationMode.BILINEAR,
                                                                     antialias=True).permute(0, 2, 3, 1)
 
-            warped_cloth = F.grid_sample(cloth.to(torch.float32), highres_grid.to(torch.float32), padding_mode='border')
+            warped_cloth = F.grid_sample(cloth.unsqueeze(0).to(torch.float32), highres_grid.to(torch.float32), padding_mode='border')
 
             # Refine the warped cloth using the refinement network
-            warped_cloth = torch.cat([im_mask, pose_map, warped_cloth], 1)
+            warped_cloth = torch.cat([im_mask, pose_map, warped_cloth.squeeze(0)], 0).unsqueeze(0)
             warped_cloth = self.refinement(warped_cloth.to(torch.float32))
             warped_cloth = warped_cloth.clamp(-1, 1)
             warped_cloth = warped_cloth.to(self.weight_dtype)
@@ -332,13 +335,20 @@ class ImgPreprocessor():
         #     labels = labels.resize((self.width, self.height), Image.NEAREST)
         #     labels = np.array(labels)
 
+
+        # quick fix for batching
+        inpaint_mask = inpaint_mask.unsqueeze(0)
+        image = image.unsqueeze(0)
+        pose_map = pose_map.unsqueeze(0)
+
         result = {}
         for k in self.outputlist:
             result[k] = vars()[k]
 
         return result
     
-    def get_image_keypoints(self, img):
+    def get_image_keypoints(self, img: Image):
+        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         estimator = BodyPoseEstimator(pretrained=True)
         keypoints = estimator(img)
         return keypoints
@@ -360,5 +370,4 @@ class ImgPreprocessor():
         )
 
         pred_seg = upsampled_logits.argmax(dim=1)[0]
-        print(pred_seg.shape)
         return pred_seg
