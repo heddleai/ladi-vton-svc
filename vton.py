@@ -294,7 +294,7 @@ class VTONService():
             batch = self.img_preprocessor.preprocess(person_image, cloth_image)
             # Generate images
             with torch.cuda.amp.autocast():
-                generate_images_from_tryon_pipe(self.val_pipe, self.inversion_adapter, batch, self.args.output_path,
+                generate_images_from_tryon_pipe(self.val_pipe, self.inversion_adapter, batch, output_path,
                                                 self.args.text_usage, self.vision_encoder, self.processor,
                                                 self.args.cloth_input_type, 1, self.args.num_vstar, self.args.seed,
                                                 self.args.num_inference_steps, self.args.guidance_scale, self.args.use_png, self.device)

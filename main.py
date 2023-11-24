@@ -116,7 +116,7 @@ def main():
 
     async def handle_execute(request):
         async def download_to(field, pathname):
-            with open(osp.join(pathname, 'wb')) as f:
+            with open(pathname, 'wb') as f:
                 while True:
                     chunk = await field.read_chunk()  # 8192 bytes by default.
                     if not chunk:
@@ -128,6 +128,8 @@ def main():
         field = await reader.next()
         assert field.name == 'request_id'
         request_id = await field.read(decode=True) # will be used later on for progress
+        request_id = request_id.decode()
+        print("handling request", request_id)
         input_path = osp.join('inputs', request_id)
         output_path = osp.join('outputs', request_id)
         os.makedirs(input_path, exist_ok=True)
@@ -147,13 +149,13 @@ def main():
         person = Image.open(person_path)
         cloth = Image.open(cloth_path)
         vton.generate_image(person, cloth, gen_path)
-        gen_img = Image.open(gen_path)
-        img_bytes = gen_img.tobytes()
+        with open(gen_path, 'rb') as f:
+            gen_img = f.read()
 
-        # os.rmdir(input_path)
-        # os.rmdir(output_path)
+        os.rmdir(input_path)
+        os.rmdir(output_path)
 
-        return web.Response(body=img_bytes, status=200)
+        return web.Response(body=gen_img, status=200, content_type="image/jpeg")
 
     app = web.Application()
     app.add_routes([

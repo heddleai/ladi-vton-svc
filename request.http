@@ -1,0 +1,21 @@
+### ---------------------------- UPLOAD FEED IMAGES ----------------------------
+POST http://localhost:8080/execute
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="request_id"
+Content-Type: text/plain
+
+54321abcde
+--boundary
+Content-Disposition: form-data; name="person"; filename="person.jpg"
+Content-Type: image/jpeg
+
+< ./person.jpg
+--boundary
+Content-Disposition: form-data; name="cloth"; filename="cloth.jpg"
+Content-Type: image/jpeg
+
+< ./cloth.jpg
+--boundary--
+### -------------------------------------------------------------------------
